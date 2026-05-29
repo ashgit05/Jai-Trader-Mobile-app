@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+yfinance
+pandas
+pyotp
+requests
+smartapi-python
+pyjwt
