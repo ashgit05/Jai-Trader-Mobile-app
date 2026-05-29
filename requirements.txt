@@ -1,8 +1,1 @@
-fastapi
-uvicorn
-yfinance
-pandas
-pyotp
-requests
-smartapi-python
-pyjwt
+fastapiuvicornyfinancepandaspyotprequestssmartapi-pythonpyjwtlogzerowebsocket-client
