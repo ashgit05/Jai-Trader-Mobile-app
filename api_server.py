@@ -6,16 +6,10 @@ import pandas as pd
 import datetime
 import pyotp
 import requests
-import math
 from SmartApi import SmartConnect
 import uvicorn
 import logging
 import os
-import json
-import time
-import uuid
-import hashlib
-import jwt  # NEW: Cryptography Library
 
 logging.basicConfig(level=logging.INFO)
 
@@ -25,198 +19,59 @@ app.add_middleware(
 )
 
 # =================================================================
-# 🔴 CRITICAL: THE SECRET KEY 🔴
-# This must perfectly match the key in your license_master.py
+# 🔐 ANGEL ONE CREDENTIALS (PULLED FROM RAILWAY VARIABLES)
 # =================================================================
-SECRET_KEY = "NIFTY_PRO_SUPER_SECRET_KEY_2026_!@#$"
+ANGEL_API_KEY = os.environ.get("R1rnnYfT", "")
+ANGEL_CLIENT_ID = os.environ.get("JAIG1059", "")
+ANGEL_PIN = os.environ.get("1921", "")
+ANGEL_TOTP_SECRET = os.environ.get("DJ6DDBZ2HEBPWGAEEEMM5RNTIE", "")
 
-# ==========================================
-# COMMERCIAL DATA STORAGE & HARDWARE LOCK
-# ==========================================
-CONFIG_FILE = "system_config.json"
-DATA_FILE = "user_data.json"
-
-raw_hwid = str(uuid.getnode()).encode()
-HWID = hashlib.sha256(raw_hwid).hexdigest()[:12].upper()
-
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, "r") as f: return json.load(f)
-    return {"is_licensed": False, "license_key": None, "angel_creds": None}
-
-def save_config(data):
-    with open(CONFIG_FILE, "w") as f: json.dump(data, f)
-
-def load_user_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f: return json.load(f)
-    return {"balance": 500000, "active_trade": {"status": "NONE", "strategy": "", "legs": [], "entryTime": ""}, "trade_history": []}
-
-def save_user_data(data):
-    with open(DATA_FILE, "w") as f: json.dump(data, f)
-
-config = load_config()
 angel_session = None
 opts_df = pd.DataFrame()
 market_cache = {"data": None, "last_fetch": None, "interval": "1h"}
 
-# ==========================================
-# ANGEL ONE INITIALIZATION
-# ==========================================
 def init_angel():
-    global angel_session, config
-    creds = config.get("angel_creds")
-    if not creds: return False
-    
+    global angel_session
+    if not ANGEL_API_KEY:
+        logging.warning("Angel One API Keys not found in Railway Variables. Waiting...")
+        return False
+        
     try:
-        angel = SmartConnect(api_key=creds["api_key"])
-        totp = pyotp.TOTP(creds["totp_secret"]).now()
-        data = angel.generateSession(creds["client_id"], creds["pin"], totp)
+        angel = SmartConnect(api_key=ANGEL_API_KEY)
+        totp = pyotp.TOTP(ANGEL_TOTP_SECRET).now()
+        data = angel.generateSession(ANGEL_CLIENT_ID, ANGEL_PIN, totp)
         if data and data.get('status'):
             angel_session = angel
-            logging.info("Angel One Commercial Session Authenticated!")
+            logging.info("✅ Angel One Cloud Session Authenticated!")
             return True
+        else:
+            logging.error(f"❌ Angel Login Failed: {data}")
     except Exception as e:
-        logging.error(f"Angel Login Failed: {e}")
+        logging.error(f"❌ Angel Login Exception: {e}")
     return False
 
 def load_instruments():
     global opts_df
     try:
-        scrip_file = "scrip_master_cache.json"
-        data = None
-        if os.path.exists(scrip_file) and (time.time() - os.path.getmtime(scrip_file)) < 86400:
-            with open(scrip_file, 'r') as f: data = json.load(f)
-        else:
-            url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
-            res = requests.get(url, timeout=30)
-            data = res.json()
-            with open(scrip_file, 'w') as f: json.dump(data, f)
-        
-        df = pd.DataFrame(data)
+        url = "https://margincalculator.angelbroking.com/OpenAPI_File/files/OpenAPIScripMaster.json"
+        res = requests.get(url, timeout=30)
+        df = pd.DataFrame(res.json())
         nifty_opts = df[(df['name'] == 'NIFTY') & (df['exch_seg'] == 'NFO') & (df['instrumenttype'] == 'OPTIDX')].copy()
         nifty_opts['expiry_dt'] = pd.to_datetime(nifty_opts['expiry'])
         nifty_opts['strike_price'] = (nifty_opts['strike'].astype(float) / 100).astype(int)
         nifty_opts = nifty_opts[nifty_opts['expiry_dt'] >= pd.Timestamp.now().normalize()]
         opts_df = nifty_opts.sort_values('expiry_dt')
+        logging.info("✅ Options chain downloaded successfully.")
     except Exception as e:
         logging.error(f"Failed to load instruments: {e}")
 
-def verify_active_license():
-    """Silently verifies the stored license on every startup."""
-    global config
-    if not config.get("license_key"):
-        config["is_licensed"] = False
-        return False
-        
-    try:
-        # Decode checks the signature AND automatically checks if 'exp' (expiration) has passed
-        payload = jwt.decode(config["license_key"], SECRET_KEY, algorithms=["HS256"])
-        if payload["hwid"] != HWID:
-            config["is_licensed"] = False
-            return False
-        
-        # If we reach here, signature is valid, HWID matches, and it hasn't expired!
-        config["is_licensed"] = True
-        return True
-    except jwt.ExpiredSignatureError:
-        logging.error("License has expired!")
-        config["is_licensed"] = False
-        return False
-    except jwt.InvalidTokenError:
-        logging.error("License signature is invalid or tampered with!")
-        config["is_licensed"] = False
-        return False
-
 @app.on_event("startup")
 def startup_event():
-    # Verify the license every time the server boots up
-    is_valid = verify_active_license()
-    save_config(config) # Save the state in case it expired
-    
-    if is_valid and config["angel_creds"]:
-        init_angel()
+    init_angel()
     load_instruments()
 
 # ==========================================
-# SYSTEM SETUP & LICENSE ENDPOINTS
-# ==========================================
-@app.get("/api/system_status")
-def get_system_status():
-    # Force a silent check every time the React UI asks for status
-    verify_active_license() 
-    return {
-        "hwid": HWID,
-        "is_licensed": config["is_licensed"],
-        "is_setup": config["angel_creds"] is not None
-    }
-
-class LicenseReq(BaseModel):
-    key: str
-
-@app.post("/api/activate_license")
-def activate_license(req: LicenseReq):
-    global config
-    try:
-        # Attempt to decode the provided key
-        payload = jwt.decode(req.key.strip(), SECRET_KEY, algorithms=["HS256"])
-        
-        # Check Hardware Match
-        if payload["hwid"] != HWID:
-            return {"success": False, "message": "This license key is locked to a different computer."}
-            
-        # If it passes, it's valid and not expired
-        config["is_licensed"] = True
-        config["license_key"] = req.key.strip()
-        save_config(config)
-        return {"success": True}
-        
-    except jwt.ExpiredSignatureError:
-        return {"success": False, "message": "This license key has expired."}
-    except jwt.InvalidTokenError:
-        return {"success": False, "message": "Invalid or tampered license key."}
-    except Exception as e:
-        return {"success": False, "message": str(e)}
-
-# ... existing code for API Endpoints (Creds, Market, Options) ...
-class CredsReq(BaseModel):
-    api_key: str
-    client_id: str
-    pin: str
-    totp_secret: str
-
-@app.post("/api/setup_credentials")
-def setup_credentials(req: CredsReq):
-    global config
-    config["angel_creds"] = req.dict()
-    save_config(config)
-    success = init_angel()
-    if not success:
-        # Clear them if invalid so they can try again
-        config["angel_creds"] = None
-        save_config(config)
-        return {"success": False, "message": "Invalid Angel One Credentials. Check your TOTP or API key."}
-    return {"success": True}
-
-# ==========================================
-# LOCAL DATABASE ENDPOINTS (Replacing LocalStorage)
-# ==========================================
-@app.get("/api/user_data")
-def get_user_data():
-    return load_user_data()
-
-class UserDataReq(BaseModel):
-    balance: float
-    active_trade: dict
-    trade_history: list
-
-@app.post("/api/user_data")
-def update_user_data(req: UserDataReq):
-    save_user_data(req.dict())
-    return {"success": True}
-
-# ==========================================
-# MARKET DATA LOGIC (Multi-Timeframe)
+# MARKET DATA LOGIC
 # ==========================================
 def fetch_nifty_market(interval: str):
     now = datetime.datetime.now()
@@ -224,9 +79,8 @@ def fetch_nifty_market(interval: str):
         if (now - market_cache["last_fetch"]).total_seconds() < 60:
             return market_cache["data"]
 
-    # Yahoo Finance timeframe limitations
     period = "60d"
-    if interval in ["1m", "2m"]: period = "7d"
+    if interval in ["1m", "2m", "5m"]: period = "7d"
     
     df = yf.download("^NSEI", period=period, interval=interval, progress=False)
     if df.empty: return None
@@ -268,6 +122,7 @@ def get_market_data(interval: str = "1h"):
     
     spot = float(current['Close'])
     is_live = False
+    
     if angel_session:
         try:
             tick = angel_session.ltpData("NSE", "Nifty 50", "26000")
@@ -315,7 +170,6 @@ def get_live_prices(req: PriceRequest):
         
     exp_df = opts_df[opts_df['expiry'] == req.expiry]
     results = {}
-    
     for leg in req.legs:
         key = f"{leg['strike']}_{leg['type']}"
         try:
