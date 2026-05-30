@@ -33,7 +33,7 @@ market_cache = {"data": None, "last_fetch": None, "interval": "1h"}
 def init_angel():
     global angel_session
     if not ANGEL_API_KEY:
-        logging.warning("Angel One API Keys not found in Railway Variables.")
+        logging.warning("Angel One API Keys not found in Railway Variables. Waiting...")
         return False
         
     try:
@@ -109,8 +109,6 @@ def fetch_nifty_market(interval: str):
 @app.get("/api/market")
 def get_market_data(interval: str = "1h"):
     global angel_session
-    
-    # 🔴 SESSION REVIVAL: Dynamically re-authenticate if it dropped
     if not angel_session:
         init_angel()
         
@@ -162,12 +160,10 @@ def get_market_data(interval: str = "1h"):
 
 @app.get("/api/options_chain")
 def get_options_chain():
-    # 🔴 FALLBACK: Re-download if empty
     if opts_df.empty: 
         load_instruments()
     if opts_df.empty: 
         return {"expiries": [], "strikes": []}
-        
     return {"expiries": opts_df['expiry'].unique().tolist(), "strikes": sorted(opts_df['strike_price'].unique().tolist())}
 
 class PriceRequest(BaseModel):
@@ -180,18 +176,22 @@ def get_live_prices(req: PriceRequest):
     if not angel_session:
         init_angel()
 
+    results = {}
+    
     if opts_df.empty or not angel_session:
         return {"prices": {f"{l.get('strike')}_{l.get('type')}": 0.0 for l in req.legs}}
         
     exp_df = opts_df[opts_df['expiry'] == req.expiry]
-    results = {}
+    
+    # 1. Gather all tokens to batch them together
+    tokens_map = {} 
+    nfo_tokens = []
     
     for leg in req.legs:
         key = f"{leg.get('strike')}_{leg.get('type')}"
         try:
-            # 🔴 BUG FIX: Force exact type matching for Pandas
             target_strike = int(leg['strike'])
-            target_type = str(leg['type']).upper()
+            target_type = str(leg['type']).strip().upper()
             
             matches = exp_df[(exp_df['strike_price'] == target_strike) & (exp_df['symbol'].str.endswith(target_type))]
             
@@ -200,22 +200,41 @@ def get_live_prices(req: PriceRequest):
                 continue
                 
             row = matches.iloc[0]
-            
-            # 🔴 CRITICAL FIX: SmartAPI strictly requires strings, Pandas handles them as ints/objects!
-            sym = str(row['symbol'])
             tok = str(row['token'])
             
-            tick = angel_session.ltpData("NFO", sym, tok)
+            tokens_map[tok] = key
+            nfo_tokens.append(tok)
             
-            if tick and isinstance(tick, dict) and tick.get('status'):
-                results[key] = float(tick['data']['ltp'])
-            else: 
-                results[key] = 0.0
-                
         except Exception as e:
-            logging.error(f"LTP Fetch Error for {key}: {str(e)}")
             results[key] = 0.0
             
+    # 2. Batch Fetching: Bypasses the 3 requests/sec rate limit completely
+    if nfo_tokens and angel_session:
+        try:
+            res = angel_session.getMarketData("LTP", {"NFO": nfo_tokens})
+            
+            if res and isinstance(res, dict) and res.get('status'):
+                fetched_data = res.get('data', {}).get('fetched', [])
+                for item in fetched_data:
+                    tok = item.get('symbolToken')
+                    ltp = float(item.get('ltp', 0.0))
+                    if tok in tokens_map:
+                        results[tokens_map[tok]] = ltp
+            else:
+                # Fallback to single fetches if the batch fails for any reason
+                for tok in nfo_tokens:
+                    sym = exp_df[exp_df['token'] == tok].iloc[0]['symbol']
+                    tick = angel_session.ltpData("NFO", sym, tok)
+                    if tick and isinstance(tick, dict) and tick.get('status'):
+                        results[tokens_map[tok]] = float(tick['data']['ltp'])
+                    else:
+                        results[tokens_map[tok]] = 0.0
+                        
+        except Exception as e:
+            logging.error(f"Live Price Batch Fetch Error: {e}")
+            for tok in nfo_tokens:
+                results[tokens_map[tok]] = 0.0
+                
     return {"prices": results}
 
 if __name__ == "__main__":
