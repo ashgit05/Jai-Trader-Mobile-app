@@ -10,6 +10,7 @@ from SmartApi import SmartConnect
 import uvicorn
 import logging
 import os
+import time
 
 logging.basicConfig(level=logging.INFO)
 
@@ -177,15 +178,10 @@ def get_live_prices(req: PriceRequest):
         init_angel()
 
     results = {}
-    
     if opts_df.empty or not angel_session:
         return {"prices": {f"{l.get('strike')}_{l.get('type')}": 0.0 for l in req.legs}}
         
     exp_df = opts_df[opts_df['expiry'] == req.expiry]
-    
-    # 1. Gather all tokens to batch them together
-    tokens_map = {} 
-    nfo_tokens = []
     
     for leg in req.legs:
         key = f"{leg.get('strike')}_{leg.get('type')}"
@@ -200,41 +196,25 @@ def get_live_prices(req: PriceRequest):
                 continue
                 
             row = matches.iloc[0]
+            
+            # 🔴 BUG FIX 1: Explicitly convert token and symbol to strings
+            sym = str(row['symbol'])
             tok = str(row['token'])
             
-            tokens_map[tok] = key
-            nfo_tokens.append(tok)
+            tick = angel_session.ltpData("NFO", sym, tok)
             
+            if tick and isinstance(tick, dict) and tick.get('status'):
+                results[key] = float(tick['data']['ltp'])
+            else: 
+                results[key] = 0.0
+                
+            # 🔴 BUG FIX 2: Prevent Angel One Rate Limit Blocks (3 req/sec limit)
+            time.sleep(0.3)
+                
         except Exception as e:
+            logging.error(f"LTP Fetch Error for {key}: {str(e)}")
             results[key] = 0.0
             
-    # 2. Batch Fetching: Bypasses the 3 requests/sec rate limit completely
-    if nfo_tokens and angel_session:
-        try:
-            res = angel_session.getMarketData("LTP", {"NFO": nfo_tokens})
-            
-            if res and isinstance(res, dict) and res.get('status'):
-                fetched_data = res.get('data', {}).get('fetched', [])
-                for item in fetched_data:
-                    tok = item.get('symbolToken')
-                    ltp = float(item.get('ltp', 0.0))
-                    if tok in tokens_map:
-                        results[tokens_map[tok]] = ltp
-            else:
-                # Fallback to single fetches if the batch fails for any reason
-                for tok in nfo_tokens:
-                    sym = exp_df[exp_df['token'] == tok].iloc[0]['symbol']
-                    tick = angel_session.ltpData("NFO", sym, tok)
-                    if tick and isinstance(tick, dict) and tick.get('status'):
-                        results[tokens_map[tok]] = float(tick['data']['ltp'])
-                    else:
-                        results[tokens_map[tok]] = 0.0
-                        
-        except Exception as e:
-            logging.error(f"Live Price Batch Fetch Error: {e}")
-            for tok in nfo_tokens:
-                results[tokens_map[tok]] = 0.0
-                
     return {"prices": results}
 
 if __name__ == "__main__":
