@@ -33,7 +33,7 @@ market_cache = {"data": None, "last_fetch": None, "interval": "1h"}
 def init_angel():
     global angel_session
     if not ANGEL_API_KEY:
-        logging.warning("Angel One API Keys not found in Railway Variables. Waiting...")
+        logging.warning("Angel One API Keys not found in Railway Variables.")
         return False
         
     try:
@@ -108,6 +108,12 @@ def fetch_nifty_market(interval: str):
 
 @app.get("/api/market")
 def get_market_data(interval: str = "1h"):
+    global angel_session
+    
+    # 🔴 SESSION REVIVAL: Dynamically re-authenticate if it dropped
+    if not angel_session:
+        init_angel()
+        
     df = fetch_nifty_market(interval)
     if df is None or df.empty:
         raise HTTPException(status_code=500, detail="Failed to fetch market data")
@@ -156,7 +162,12 @@ def get_market_data(interval: str = "1h"):
 
 @app.get("/api/options_chain")
 def get_options_chain():
-    if opts_df.empty: return {"expiries": [], "strikes": []}
+    # 🔴 FALLBACK: Re-download if empty
+    if opts_df.empty: 
+        load_instruments()
+    if opts_df.empty: 
+        return {"expiries": [], "strikes": []}
+        
     return {"expiries": opts_df['expiry'].unique().tolist(), "strikes": sorted(opts_df['strike_price'].unique().tolist())}
 
 class PriceRequest(BaseModel):
@@ -165,20 +176,45 @@ class PriceRequest(BaseModel):
 
 @app.post("/api/live_prices")
 def get_live_prices(req: PriceRequest):
+    global angel_session
+    if not angel_session:
+        init_angel()
+
     if opts_df.empty or not angel_session:
-        return {"prices": {f"{l['strike']}_{l['type']}": 0.0 for l in req.legs}}
+        return {"prices": {f"{l.get('strike')}_{l.get('type')}": 0.0 for l in req.legs}}
         
     exp_df = opts_df[opts_df['expiry'] == req.expiry]
     results = {}
+    
     for leg in req.legs:
-        key = f"{leg['strike']}_{leg['type']}"
+        key = f"{leg.get('strike')}_{leg.get('type')}"
         try:
-            row = exp_df[(exp_df['strike_price'] == leg['strike']) & (exp_df['symbol'].str.endswith(leg['type']))].iloc[0]
-            tick = angel_session.ltpData("NFO", row['symbol'], row['token'])
+            # 🔴 BUG FIX: Force exact type matching for Pandas
+            target_strike = int(leg['strike'])
+            target_type = str(leg['type']).upper()
+            
+            matches = exp_df[(exp_df['strike_price'] == target_strike) & (exp_df['symbol'].str.endswith(target_type))]
+            
+            if matches.empty:
+                results[key] = 0.0
+                continue
+                
+            row = matches.iloc[0]
+            
+            # 🔴 CRITICAL FIX: SmartAPI strictly requires strings, Pandas handles them as ints/objects!
+            sym = str(row['symbol'])
+            tok = str(row['token'])
+            
+            tick = angel_session.ltpData("NFO", sym, tok)
+            
             if tick and isinstance(tick, dict) and tick.get('status'):
                 results[key] = float(tick['data']['ltp'])
-            else: results[key] = 0.0
-        except: results[key] = 0.0
+            else: 
+                results[key] = 0.0
+                
+        except Exception as e:
+            logging.error(f"LTP Fetch Error for {key}: {str(e)}")
+            results[key] = 0.0
             
     return {"prices": results}
 
